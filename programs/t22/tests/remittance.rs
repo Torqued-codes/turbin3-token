@@ -5,7 +5,15 @@ use anchor_lang::{
     solana_program::{instruction::Instruction, system_program},
     InstructionData, ToAccountMetas,
 };
-use anchor_spl::token_interface::spl_token_2022::{
+use litesvm::LiteSVM;
+use proofext::instruction::ProofLocation;
+use proofgen::{transfer::transfer_split_proof_data, withdraw::withdraw_proof_data};
+use solana_keypair::Keypair;
+use solana_message::Message;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use t22::{accounts, instruction, ID};
+use t22new::{
     extension::{
         confidential_transfer::{
             instruction as ct_ix, ConfidentialTransferAccount, ConfidentialTransferMint,
@@ -15,29 +23,23 @@ use anchor_spl::token_interface::spl_token_2022::{
         metadata_pointer::MetadataPointer,
         mint_close_authority::MintCloseAuthority,
         permanent_delegate::PermanentDelegate,
-        transfer_fee::TransferFeeConfig,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
     instruction::{approve, initialize_account3, mint_to},
     state::{Account as TokenAccountState, AccountState, Mint as MintState},
 };
-use litesvm::LiteSVM;
-use proofext::instruction::ProofLocation;
-use proofgen::{
-    transfer_split_proof_data, withdraw_proof_data,
-    zk_elgamal_proof_program::instruction::ProofInstruction,
+use zk::{
+    encryption::{
+        auth_encryption::{AeCiphertext, AeKey},
+        derivation::derive_confidential_keys,
+        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
+    },
+    zk_elgamal_proof_program::pubkey_validity::build_pubkey_validity_proof_data,
 };
-use solana_keypair::Keypair;
-use solana_message::Message;
-use solana_signer::Signer;
-use solana_transaction::Transaction;
-use t22::{accounts, instruction, ID};
-use zk::encryption::{
-    auth_encryption::{AeCiphertext, AeKey},
-    elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey},
-    pod::elgamal::PodElGamalCiphertext,
+use zkif::{
+    instruction::{ContextStateInfo, ProofInstruction},
+    proof_data::ZkProofData,
 };
-use zkif::proof_data::PubkeyValidityProofData;
 
 const TOKEN_2022_PROGRAM_ID: Pubkey = anchor_spl::token_interface::spl_token_2022::ID;
 const DECIMALS: u8 = 6;
@@ -53,7 +55,7 @@ struct ConfidentialHolder {
 fn setup() -> (LiteSVM, Keypair) {
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
-    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
 
     let program_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy/t22.so");
@@ -75,29 +77,19 @@ fn send(svm: &mut LiteSVM, payer: &Keypair, ixs: &[Instruction], extra_signers: 
     let mut tx = Transaction::new_unsigned(Message::new(ixs, Some(&payer.pubkey())));
     tx.try_sign(&signers, blockhash).unwrap();
 
-    if let Err(err) = svm.send_transaction(transaction_with_fallback(tx)) {
-        panic!("transaction failed:\n{err:#?}");
+    if let Err(err) = svm.send_transaction(tx) {
+        panic!("transaction failed:\n{:#?}", err.meta.logs);
     }
 }
 
-fn transaction_with_fallback(tx: Transaction) -> Transaction {
-    tx
-}
-
-fn derive_keys(owner: &Keypair, seed: &[u8]) -> (ElGamalKeypair, AeKey) {
-    let elgamal = ElGamalKeypair::new_from_signer(owner, seed).unwrap();
-    let aes = AeKey::new_from_signer(owner, seed).unwrap();
-    (elgamal, aes)
-}
-
-fn stage_proof<T: bytemuck::Pod>(
+fn stage_proof<T: bytemuck::Pod + ZkProofData<U>, U: bytemuck::Pod>(
     svm: &mut LiteSVM,
     payer: &Keypair,
     proof_ix: ProofInstruction,
     proof_data: &T,
 ) -> Pubkey {
     let context_account = Keypair::new();
-    let space = proof_ix.context_state_account_size();
+    let space = std::mem::size_of::<zkif::state::ProofContextState<U>>();
     let lamports = svm.minimum_balance_for_rent_exemption(space);
 
     let create_ix = solana_system_interface::instruction::create_account(
@@ -105,10 +97,10 @@ fn stage_proof<T: bytemuck::Pod>(
         &context_account.pubkey(),
         lamports,
         space as u64,
-        &zkif::id(),
+        &zkif::ID,
     );
     let verify_ix = proof_ix.encode_verify_proof(
-        Some(zkif::instruction::ContextStateInfo {
+        Some(ContextStateInfo {
             context_state_account: &context_account.pubkey(),
             context_state_authority: &payer.pubkey(),
         }),
@@ -183,13 +175,19 @@ fn tasks_1_to_4_remittance_mint_kyc_thaw_and_fee_transfer() {
     assert!(exts.contains(&ExtensionType::MintCloseAuthority));
 
     let meta_ptr = mint_state.get_extension::<MetadataPointer>().unwrap();
-    assert_eq!(Option::<Pubkey>::from(meta_ptr.metadata_address), Some(mint.pubkey()));
+    assert_eq!(
+        Option::<Pubkey>::from(meta_ptr.metadata_address),
+        Some(mint.pubkey())
+    );
 
     let default_state = mint_state.get_extension::<DefaultAccountState>().unwrap();
     assert_eq!(default_state.state, AccountState::Frozen as u8);
 
     let close_auth = mint_state.get_extension::<MintCloseAuthority>().unwrap();
-    assert_eq!(Option::<Pubkey>::from(close_auth.close_authority), Some(payer.pubkey()));
+    assert_eq!(
+        Option::<Pubkey>::from(close_auth.close_authority),
+        Some(payer.pubkey())
+    );
 
     // Create Alice & Bob token accounts (automatically Frozen due to DefaultAccountState)
     let alice_owner = payer.insecure_clone();
@@ -197,9 +195,9 @@ fn tasks_1_to_4_remittance_mint_kyc_thaw_and_fee_transfer() {
     let alice_ta = Keypair::new();
     let bob_ta = Keypair::new();
 
-    let required_exts =
-        ExtensionType::get_required_init_account_extensions(&exts);
-    let ta_space = ExtensionType::try_calculate_account_len::<TokenAccountState>(&required_exts).unwrap();
+    let required_exts = ExtensionType::get_required_init_account_extensions(&exts);
+    let ta_space =
+        ExtensionType::try_calculate_account_len::<TokenAccountState>(&required_exts).unwrap();
     let ta_rent = svm.minimum_balance_for_rent_exemption(ta_space);
 
     for (ta, owner) in [(&alice_ta, &alice_owner), (&bob_ta, &bob_owner)] {
@@ -214,8 +212,13 @@ fn tasks_1_to_4_remittance_mint_kyc_thaw_and_fee_transfer() {
                     ta_space as u64,
                     &TOKEN_2022_PROGRAM_ID,
                 ),
-                initialize_account3(&TOKEN_2022_PROGRAM_ID, &ta.pubkey(), &mint.pubkey(), &owner.pubkey())
-                    .unwrap(),
+                initialize_account3(
+                    &TOKEN_2022_PROGRAM_ID,
+                    &ta.pubkey(),
+                    &mint.pubkey(),
+                    &owner.pubkey(),
+                )
+                .unwrap(),
             ],
             &[ta],
         );
@@ -322,7 +325,9 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
     let pd = mint_state.get_extension::<PermanentDelegate>().unwrap();
     assert_eq!(Option::<Pubkey>::from(pd.delegate), Some(payer.pubkey()));
 
-    let ct_mint = mint_state.get_extension::<ConfidentialTransferMint>().unwrap();
+    let ct_mint = mint_state
+        .get_extension::<ConfidentialTransferMint>()
+        .unwrap();
     assert!(!bool::from(ct_mint.auto_approve_new_accounts)); // manual policy verified
 
     let alice_owner = payer.insecure_clone();
@@ -351,8 +356,13 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
                     space as u64,
                     &TOKEN_2022_PROGRAM_ID,
                 ),
-                initialize_account3(&TOKEN_2022_PROGRAM_ID, &ta.pubkey(), &mint.pubkey(), &owner.pubkey())
-                    .unwrap(),
+                initialize_account3(
+                    &TOKEN_2022_PROGRAM_ID,
+                    &ta.pubkey(),
+                    &mint.pubkey(),
+                    &owner.pubkey(),
+                )
+                .unwrap(),
             ],
             &[&ta],
         );
@@ -376,8 +386,8 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
         );
 
         // Task 6a: ConfigureAccount (owner-only)
-        let (elgamal, aes) = derive_keys(owner, b"remittance-ct");
-        let proof = PubkeyValidityProofData::new(&elgamal).unwrap();
+        let (elgamal, aes) = derive_confidential_keys(owner, b"remittance-ct").unwrap();
+        let proof = build_pubkey_validity_proof_data(&elgamal).unwrap();
         let cfg_ixs = ct_ix::configure_account(
             &TOKEN_2022_PROGRAM_ID,
             &ta.pubkey(),
@@ -459,7 +469,11 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
 
     // Task 6d: ApplyPendingBalance on Alice
     let alice_ct = read_ct(&svm, &alice.account);
-    let new_alice_bal = alice.aes.encrypt(50_000);
+    let new_alice_bal: [u8; 36] = bytemuck::bytes_of(&t22new::extension::confidential_transfer::DecryptableBalance::from(
+        alice.aes.encrypt(50_000),
+    ))
+    .try_into()
+    .unwrap();
     send(
         &mut svm,
         &payer,
@@ -475,20 +489,26 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
                 expected_pending_balance_credit_counter: alice_ct
                     .pending_balance_credit_counter
                     .into(),
-                new_decryptable_available_balance: new_alice_bal.into(),
+                new_decryptable_available_balance: new_alice_bal,
             }
             .data(),
         }],
         &[],
     );
-    assert_eq!(available_balance(&read_ct(&svm, &alice.account), &alice.aes), 50_000);
+    assert_eq!(
+        available_balance(&read_ct(&svm, &alice.account), &alice.aes),
+        50_000
+    );
 
     // Task 6e: Confidential Transfer (20,000 from Alice to Bob)
     let transfer_amount = 20_000u64;
     let alice_ct = read_ct(&svm, &alice.account);
     let current_avail: ElGamalCiphertext = alice_ct.available_balance.try_into().unwrap();
     let current_dec: AeCiphertext = alice_ct.decryptable_available_balance.try_into().unwrap();
-    let bob_pk: ElGamalPubkey = read_ct(&svm, &bob.account).elgamal_pubkey.try_into().unwrap();
+    let bob_pk: ElGamalPubkey = read_ct(&svm, &bob.account)
+        .elgamal_pubkey
+        .try_into()
+        .unwrap();
 
     let proofs = transfer_split_proof_data(
         &current_avail,
@@ -544,11 +564,18 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
     .unwrap();
     send(&mut svm, &payer, &tx_ixs, &[&alice_owner]);
 
-    assert_eq!(pending_balance(&read_ct(&svm, &bob.account), &bob.elgamal), 20_000);
+    assert_eq!(
+        pending_balance(&read_ct(&svm, &bob.account), &bob.elgamal),
+        20_000
+    );
 
     // Task 6f: ApplyPendingBalance on Bob BEFORE WithdrawConfidentialTokens
     let bob_ct = read_ct(&svm, &bob.account);
-    let bob_avail_enc = bob.aes.encrypt(20_000);
+    let bob_avail_enc: [u8; 36] = bytemuck::bytes_of(&t22new::extension::confidential_transfer::DecryptableBalance::from(
+        bob.aes.encrypt(20_000),
+    ))
+    .try_into()
+    .unwrap();
     send(
         &mut svm,
         &payer,
@@ -564,7 +591,7 @@ fn tasks_5_and_6_seizable_confidential_mint_and_full_lifecycle() {
                 expected_pending_balance_credit_counter: bob_ct
                     .pending_balance_credit_counter
                     .into(),
-                new_decryptable_available_balance: bob_avail_enc.into(),
+                new_decryptable_available_balance: bob_avail_enc,
             }
             .data(),
         }],
@@ -668,8 +695,13 @@ fn extension_challenge_cpi_guard_with_top_level_approve_delegate() {
                     space as u64,
                     &TOKEN_2022_PROGRAM_ID,
                 ),
-                initialize_account3(&TOKEN_2022_PROGRAM_ID, &ta.pubkey(), &mint.pubkey(), &owner.pubkey())
-                    .unwrap(),
+                initialize_account3(
+                    &TOKEN_2022_PROGRAM_ID,
+                    &ta.pubkey(),
+                    &mint.pubkey(),
+                    &owner.pubkey(),
+                )
+                .unwrap(),
             ],
             &[ta],
         );
@@ -738,38 +770,6 @@ fn extension_challenge_cpi_guard_with_top_level_approve_delegate() {
     let dest_state = StateWithExtensions::<TokenAccountState>::unpack(&dest_acct.data).unwrap();
     assert_eq!(dest_state.base.amount, 2_500);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
